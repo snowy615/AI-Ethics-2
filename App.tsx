@@ -1,6 +1,7 @@
+
 import React, { useState, useRef, useEffect } from 'react';
-import { AIPersona, DebatePhase, DebateMessage, Votes, Source, ArgumentComparison } from './types';
-import { getDebateSides, generateDebateTurnStream, generateSpeech, generateDebateSummary, generateArgumentComparison } from './services/geminiService';
+import { AIPersona, DebatePhase, DebateMessage, Source, ArgumentComparison, Score, DebateScore } from './types';
+import { getDebateSides, generateDebateTurnStream, generateSpeech, generateDebateSummary, generateArgumentComparison, generateDebateScore } from './services/geminiService';
 import { decode, decodeAudioData } from './utils/audioUtils';
 import { LoadingSpinner, SendIcon, BrainIcon, SkipIcon, LinkIcon, FastForwardIcon } from './components/icons';
 
@@ -9,7 +10,8 @@ const App: React.FC = () => {
     const [question, setQuestion] = useState<string>('');
     const [sides, setSides] = useState<{ [key in AIPersona]: string }>({ [AIPersona.Logos]: '', [AIPersona.Pathos]: '' });
     const [messages, setMessages] = useState<DebateMessage[]>([]);
-    const [votes, setVotes] = useState<Votes>({ [AIPersona.Logos]: 0, [AIPersona.Pathos]: 0 });
+    const [userVote, setUserVote] = useState<AIPersona | null>(null);
+    const [scoreData, setScoreData] = useState<DebateScore | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [statusText, setStatusText] = useState<string>('');
     const [speakingMessageIndex, setSpeakingMessageIndex] = useState<number | null>(null);
@@ -30,6 +32,17 @@ const App: React.FC = () => {
         { persona: AIPersona.Logos, stage: 'CLOSING' },
         { persona: AIPersona.Pathos, stage: 'CLOSING' },
     ];
+
+    const scoreWeights: { [key: string]: number } = {
+      'Positioning': 0.10,
+      'Argument': 0.20,
+      'Evidence': 0.20,
+      'Refutation': 0.15,
+      'Coverage': 0.10,
+      'Ethics': 0.10,
+      'Clarity': 0.10,
+      'Tone': 0.05,
+    };
 
     useEffect(() => {
         if (debateLogRef.current) {
@@ -260,9 +273,50 @@ const App: React.FC = () => {
         setPhase(DebatePhase.VOTING);
     };
 
-    const handleVote = (persona: AIPersona) => {
-        setVotes(prev => ({ ...prev, [persona]: prev[persona] + 1 }));
-        setPhase(DebatePhase.FINISHED);
+    const calculateFinalScore = (scores: Score[]): number => {
+        let total = 0;
+        scores.forEach(scoreItem => {
+            // Find the key in scoreWeights that matches scoreItem.criteria, ignoring case and punctuation
+            const weightKey = Object.keys(scoreWeights).find(key => key.toLowerCase() === scoreItem.criteria.toLowerCase().replace(/[^\w\s]/gi, ''));
+            if (weightKey && scoreWeights[weightKey]) {
+                total += scoreItem.score * scoreWeights[weightKey];
+            }
+        });
+        return parseFloat(total.toFixed(2));
+    };
+
+    const handleVote = async (persona: AIPersona) => {
+        setUserVote(persona);
+        setPhase(DebatePhase.SCORING);
+        
+        try {
+            const rawScores = await generateDebateScore(messages, question);
+            const logosFinal = calculateFinalScore(rawScores.logos);
+            const pathosFinal = calculateFinalScore(rawScores.pathos);
+            
+            let winner: AIPersona | 'TIE' = 'TIE';
+            if (logosFinal > pathosFinal) {
+                winner = AIPersona.Logos;
+            } else if (pathosFinal > logosFinal) {
+                winner = AIPersona.Pathos;
+            }
+
+            setScoreData({
+                [AIPersona.Logos]: rawScores.logos,
+                [AIPersona.Pathos]: rawScores.pathos,
+                finalScores: {
+                    [AIPersona.Logos]: logosFinal,
+                    [AIPersona.Pathos]: pathosFinal,
+                },
+                winner: winner,
+            });
+
+            setPhase(DebatePhase.FINISHED);
+        } catch (err: any) {
+            console.error("Failed to get debate score:", err);
+            setError("The AI Judge failed to score the debate. Please try again.");
+            setPhase(DebatePhase.VOTING); // Revert to voting
+        }
     };
 
     const handleReset = () => {
@@ -275,7 +329,8 @@ const App: React.FC = () => {
         setQuestion('');
         setMessages([]);
         setError(null);
-        setVotes({ [AIPersona.Logos]: 0, [AIPersona.Pathos]: 0 });
+        setUserVote(null);
+        setScoreData(null);
         setSpeakingMessageIndex(null);
         setStatusText('');
         setSummary(null);
@@ -389,7 +444,13 @@ const App: React.FC = () => {
     );
     
     const renderVoting = () => (
-        <div className="text-center bg-white p-8 rounded-2xl shadow-2xl w-full max-w-4xl mx-auto">
+        <div className="relative text-center bg-white p-8 rounded-2xl shadow-2xl w-full max-w-4xl mx-auto">
+             {phase === DebatePhase.SCORING && (
+                <div className="absolute inset-0 bg-white/80 backdrop-blur-sm flex flex-col justify-center items-center rounded-2xl z-10">
+                    <LoadingSpinner className="w-12 h-12 text-blue-600" />
+                    <p className="mt-4 text-gray-700 font-semibold">The AI Judge is scoring the debate...</p>
+                </div>
+            )}
             <h2 className="text-3xl font-bold mb-2 text-gray-800">Who Won the Debate?</h2>
             <p className="text-gray-600 mb-8">Review the key arguments and cast your vote.</p>
 
@@ -471,17 +532,83 @@ const App: React.FC = () => {
                     Vote for Pathos
                 </button>
             </div>
+            {error && <p className="text-red-500 text-center mt-4">{error}</p>}
         </div>
     );
 
     const renderFinished = () => {
-        const winner = votes[AIPersona.Logos] > votes[AIPersona.Pathos] ? AIPersona.Logos : AIPersona.Pathos;
-        const winnerText = votes[AIPersona.Logos] === votes[AIPersona.Pathos] ? "It's a tie!" : `${winner} wins the debate!`;
+        if (!scoreData || !userVote) {
+             return (
+                <div className="flex flex-col justify-center items-center h-full text-gray-800">
+                    <LoadingSpinner className="w-12 h-12" />
+                    <p className="mt-4">Loading results...</p>
+                </div>
+            );
+        }
+    
+        const { finalScores, winner } = scoreData;
+    
         return (
-            <div className="text-center">
-                <h2 className="text-3xl font-bold mb-4 text-gray-800">Debate Finished!</h2>
-                <p className="text-2xl text-green-600 font-semibold mb-8">{winnerText}</p>
-                <button onClick={handleReset} className="bg-gray-700 text-white font-bold py-3 px-6 rounded-lg hover:bg-gray-800 transition-colors">
+            <div className="text-center bg-white p-8 rounded-2xl shadow-2xl w-full max-w-5xl mx-auto overflow-y-auto max-h-[90vh]">
+                <h2 className="text-3xl font-bold mb-4 text-gray-800">Debate Results</h2>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 my-8">
+                    <div className="bg-gray-100 p-4 rounded-lg">
+                        <p className="text-sm text-gray-600">Your Vote</p>
+                        <p className={`text-2xl font-bold ${userVote === AIPersona.Logos ? 'text-blue-600' : 'text-purple-600'}`}>{userVote}</p>
+                    </div>
+                    <div className="bg-green-100 p-4 rounded-lg border border-green-300">
+                        <p className="text-sm text-green-800">AI Judge's Verdict</p>
+                        <p className={`text-2xl font-bold ${winner === AIPersona.Logos ? 'text-blue-600' : winner === AIPersona.Pathos ? 'text-purple-600' : 'text-gray-700'}`}>
+                            {winner === 'TIE' ? "It's a Tie!" : `${winner} Wins!`}
+                        </p>
+                    </div>
+                </div>
+    
+                <h3 className="text-2xl font-bold mb-2 text-gray-800">Final Scorecard</h3>
+                <p className="mb-4 text-gray-600 text-sm">Scores are weighted. Maximum possible score is 5.</p>
+    
+                <div className="text-center mb-6">
+                    <span className="text-2xl font-bold text-blue-600">Logos: {finalScores.Logos}</span>
+                    <span className="text-gray-400 mx-4">vs</span>
+                    <span className="text-2xl font-bold text-purple-600">Pathos: {finalScores.Pathos}</span>
+                </div>
+    
+                <div className="overflow-x-auto bg-white rounded-lg border">
+                    <table className="w-full text-sm text-left text-gray-700">
+                        <thead className="bg-gray-100 text-xs text-gray-800 uppercase">
+                            <tr>
+                                <th scope="col" className="px-6 py-3 w-1/5">Criteria (Weight)</th>
+                                <th scope="col" className="px-6 py-3 text-blue-800">Logos Score & Notes</th>
+                                <th scope="col" className="px-6 py-3 text-purple-800">Pathos Score & Notes</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {scoreData.Logos.map((logosScore, index) => {
+                                const pathosScore = scoreData.Pathos[index];
+                                const weight = scoreWeights[logosScore.criteria] ? scoreWeights[logosScore.criteria] * 100 : 0;
+                                return (
+                                    <tr key={index} className="bg-white border-b hover:bg-gray-50">
+                                        <td className="px-6 py-4 font-semibold text-gray-900">
+                                            {logosScore.criteria}
+                                            <span className="block text-xs font-normal text-gray-500">{weight}%</span>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <p className="font-bold text-blue-700">{logosScore.score} / 5</p>
+                                            <p className="text-xs text-gray-600 italic">"{logosScore.notes}"</p>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <p className="font-bold text-purple-700">{pathosScore.score} / 5</p>
+                                            <p className="text-xs text-gray-600 italic">"{pathosScore.notes}"</p>
+                                        </td>
+                                    </tr>
+                                )
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+    
+                <button onClick={handleReset} className="mt-8 bg-gray-700 text-white font-bold py-3 px-6 rounded-lg hover:bg-gray-800 transition-colors">
                     Start a New Debate
                 </button>
             </div>
@@ -496,6 +623,7 @@ const App: React.FC = () => {
             case DebatePhase.DEBATING:
                 return renderDebate();
             case DebatePhase.VOTING:
+            case DebatePhase.SCORING:
                 return renderVoting();
             case DebatePhase.FINISHED:
                 return renderFinished();
@@ -509,7 +637,7 @@ const App: React.FC = () => {
              <div className={`w-full transition-all duration-500 ${
                 phase === DebatePhase.DEBATING || phase === DebatePhase.ANALYZING 
                     ? 'max-w-3xl h-[80vh]' 
-                    : 'max-w-4xl'
+                    : 'max-w-5xl'
                 }`}>
                 {renderContent()}
             </div>

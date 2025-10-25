@@ -1,6 +1,6 @@
 
 import { GoogleGenAI, Type, GenerateContentResponse, Chat, Modality } from "@google/genai";
-import { AIPersona, DebateMessage, ArgumentComparison } from '../types';
+import { AIPersona, DebateMessage, ArgumentComparison, Score } from '../types';
 
 if (!process.env.API_KEY) {
     console.warn("API_KEY environment variable not set. Please provide a valid API key for the application to function.");
@@ -186,6 +186,76 @@ Provide the comparison in a JSON format. It should be an array of objects, where
     } catch (error) {
         console.error("Error generating argument comparison:", error);
         throw new Error("Could not generate the argument comparison table.");
+    }
+};
+
+export const generateDebateScore = async (debateHistory: DebateMessage[], question: string): Promise<{ logos: Score[], pathos: Score[] }> => {
+    const debateTranscript = debateHistory
+        .filter(msg => msg.persona !== 'SYSTEM')
+        .map(msg => `${msg.persona}: ${msg.text}`)
+        .join('\n');
+
+    const prompt = `You are an impartial and expert debate judge. Your task is to analyze the following debate transcript on the topic "${question}" and score both participants, Logos and Pathos, based on a detailed rubric.
+
+Debate Transcript:
+---
+${debateTranscript}
+---
+
+Grading Rubric:
+Please score each debater on a scale of 0 to 5 for each of the following criteria. Provide brief notes (one sentence) justifying your score for each criterion. The criteria are, in order: Positioning, Argument, Evidence, Refutation, Coverage, Ethics, Clarity, Tone.
+
+1.  **Positioning (10%):** How well did they establish and maintain their stance?
+2.  **Argument (20%):** How logical and well-structured were their arguments?
+3.  **Evidence (20%):** How effectively did they use facts, data, or sources to support their claims? (Note: For Pathos, who uses emotional appeals, score based on the effectiveness and relevance of their appeals).
+4.  **Refutation (15%):** How well did they address and counter their opponent's points?
+5.  **Coverage (10%):** Did they address the core aspects of the question?
+6.  **Ethics (10%):** Did they handle the ethical dimensions of the topic with nuance?
+7.  **Clarity (10%):** How clear and understandable were their points?
+8.  **Tone (5%):** Was their tone appropriate and effective for their persona?
+
+Provide your response in the specified JSON format.`;
+
+    const scoreItemSchema = {
+        type: Type.OBJECT,
+        properties: {
+            criteria: { type: Type.STRING },
+            score: { type: Type.NUMBER, description: "A score from 0 to 5." },
+            notes: { type: Type.STRING, description: "Brief justification for the score, one sentence." }
+        },
+        required: ['criteria', 'score', 'notes']
+    };
+
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-pro',
+            contents: prompt,
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        logos: {
+                            type: Type.ARRAY,
+                            description: "An array of 8 scores for the Logos persona, following the rubric order.",
+                            items: scoreItemSchema
+                        },
+                        pathos: {
+                            type: Type.ARRAY,
+                            description: "An array of 8 scores for the Pathos persona, following the rubric order.",
+                            items: scoreItemSchema
+                        }
+                    },
+                    required: ['logos', 'pathos']
+                }
+            }
+        });
+        const jsonText = response.text.trim();
+        const parsed = JSON.parse(jsonText);
+        return { logos: parsed.logos, pathos: parsed.pathos };
+    } catch (error) {
+        console.error("Error generating debate score:", error);
+        throw new Error("Could not generate the debate score.");
     }
 };
 
