@@ -1,0 +1,5 @@
+{
+  "name": "Copy of AI Ethical Debate Arena",
+  "description": "A web application where users can submit a complex ethical question and watch two AI personas debate the topic in real-time. The debate is presented with generated speech for each AI. After the debate, users can vote for the argument they found more compelling.",
+  "requestFramePermissions": []
+}
