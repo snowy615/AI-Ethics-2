@@ -12,13 +12,25 @@ export enum DebatePhase {
   FINISHED = 'FINISHED',
 }
 
+export interface Source {
+  uri: string;
+  title: string;
+}
+
 export interface DebateMessage {
   persona: AIPersona | 'SYSTEM';
   text: string;
   isStreaming?: boolean;
+  sources?: Source[];
 }
 
 export interface Votes {
   [AIPersona.Logos]: number;
   [AIPersona.Pathos]: number;
+}
+
+export interface ArgumentComparison {
+  topic: string;
+  logosStance: string;
+  pathosStance: string;
 }

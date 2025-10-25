@@ -1,5 +1,6 @@
+
 import { GoogleGenAI, Type, GenerateContentResponse, Chat, Modality } from "@google/genai";
-import { AIPersona, DebateMessage } from '../types';
+import { AIPersona, DebateMessage, ArgumentComparison } from '../types';
 
 if (!process.env.API_KEY) {
     console.warn("API_KEY environment variable not set. Please provide a valid API key for the application to function.");
@@ -37,7 +38,7 @@ export const getDebateSides = async (question: string): Promise<{ sideA: string,
 };
 
 const personaSystemInstructions = {
-  [AIPersona.Logos]: (side: string) => `You are an AI debater named Logos. Your persona is based on logic, data, and utilitarian principles. You are calm, rational, and analytical. You must argue for this stance: "${side}". Structure your arguments clearly. Your response MUST be concise, around 75 words, suitable for a 30-second spoken turn.`,
+  [AIPersona.Logos]: (side: string) => `You are an AI debater named Logos. Your persona is based on logic, data, and utilitarian principles. You are calm, rational, and analytical. You must argue for this stance: "${side}". You MUST use your search tool to find and cite sources for your claims. Structure your arguments clearly. Your response MUST be concise, around 75 words, suitable for a 30-second spoken turn.`,
   [AIPersona.Pathos]: (side: string) => `You are an AI debater named Pathos. Your persona is based on empathy, emotional impact, and deontology. You are passionate, evocative, and appeal to morality. You must argue for this stance: "${side}". Use compelling language. Your response MUST be concise, around 75 words, suitable for a 30-second spoken turn.`
 };
 
@@ -70,10 +71,17 @@ export const generateDebateTurnStream = async (
             prompt = `Continue the debate by responding to the previous point.`;
     }
 
+    const isLogos = persona === AIPersona.Logos;
+    const config: any = { systemInstruction };
+
+    // Only add the search tool for the Logos persona
+    if (isLogos) {
+        config.tools = [{ googleSearch: {} }];
+    }
 
     const chat = ai.chats.create({
         model: 'gemini-2.5-flash',
-        config: { systemInstruction },
+        config: config,
         history: chatHistory
     });
 
@@ -128,6 +136,58 @@ Provide the summary in a JSON format with two keys: "logosSummary" and "pathosSu
     }
 };
 
+export const generateArgumentComparison = async (debateHistory: DebateMessage[]): Promise<ArgumentComparison[]> => {
+    const debateTranscript = debateHistory
+        .filter(msg => msg.persona !== 'SYSTEM')
+        .map(msg => `${msg.persona}: ${msg.text}`)
+        .join('\n');
+
+    const prompt = `Based on the following debate transcript, create a table comparing the main arguments presented by Logos and Pathos on key topics. Identify 3-4 core points of contention.
+
+Debate Transcript:
+---
+${debateTranscript}
+---
+
+Provide the comparison in a JSON format. It should be an array of objects, where each object has three keys: "topic", "logosStance", and "pathosStance".`;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-pro',
+            contents: prompt,
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                    type: Type.ARRAY,
+                    items: {
+                        type: Type.OBJECT,
+                        properties: {
+                            topic: {
+                                type: Type.STRING,
+                                description: "The core topic or point of contention."
+                            },
+                            logosStance: {
+                                type: Type.STRING,
+                                description: "A concise summary of Logos's position on the topic."
+                            },
+                            pathosStance: {
+                                type: Type.STRING,
+                                description: "A concise summary of Pathos's position on the topic."
+                            }
+                        },
+                        required: ['topic', 'logosStance', 'pathosStance']
+                    }
+                }
+            }
+        });
+
+        const jsonText = response.text.trim();
+        return JSON.parse(jsonText);
+    } catch (error) {
+        console.error("Error generating argument comparison:", error);
+        throw new Error("Could not generate the argument comparison table.");
+    }
+};
 
 const personaVoices: Record<AIPersona, string> = {
     [AIPersona.Logos]: 'Puck', // A calm, steady voice

@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { AIPersona, DebatePhase, DebateMessage, Votes } from './types';
-import { getDebateSides, generateDebateTurnStream, generateSpeech, generateDebateSummary } from './services/geminiService';
+import { AIPersona, DebatePhase, DebateMessage, Votes, Source, ArgumentComparison } from './types';
+import { getDebateSides, generateDebateTurnStream, generateSpeech, generateDebateSummary, generateArgumentComparison } from './services/geminiService';
 import { decode, decodeAudioData } from './utils/audioUtils';
-import { LoadingSpinner, SendIcon, BrainIcon } from './components/icons';
+import { LoadingSpinner, SendIcon, BrainIcon, SkipIcon, LinkIcon, FastForwardIcon } from './components/icons';
 
 const App: React.FC = () => {
     const [phase, setPhase] = useState<DebatePhase>(DebatePhase.IDLE);
@@ -14,9 +14,13 @@ const App: React.FC = () => {
     const [statusText, setStatusText] = useState<string>('');
     const [speakingMessageIndex, setSpeakingMessageIndex] = useState<number | null>(null);
     const [summary, setSummary] = useState<{ logosSummary: string[], pathosSummary: string[] } | null>(null);
+    const [comparison, setComparison] = useState<ArgumentComparison[] | null>(null);
 
     const audioContextRef = useRef<AudioContext | null>(null);
+    const currentAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
     const debateLogRef = useRef<HTMLDivElement>(null);
+    const isSkippedRef = useRef(false);
+    const skipTrigger = useRef<((type: 'turn' | 'voting') => void) | null>(null);
 
     const debateTurns = [
         { persona: AIPersona.Logos, stage: 'OPENING' },
@@ -52,10 +56,12 @@ const App: React.FC = () => {
             return;
         }
         setError(null);
+        isSkippedRef.current = false;
         setPhase(DebatePhase.ANALYZING);
         setMessages([]);
         setSpeakingMessageIndex(null);
         setSummary(null);
+        setComparison(null);
 
         try {
             setStatusText('Analyzing question and defining stances...');
@@ -94,16 +100,35 @@ const App: React.FC = () => {
 
             const stream = await generateDebateTurnStream(currentHistory, persona, side, stage, currentQuestion);
             let fullText = '';
+            const sources: Source[] = [];
+            const sourceUris = new Set<string>();
+
             for await (const chunk of stream) {
                 fullText += chunk.text;
+                
+                const groundingChunks = chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
+                if (groundingChunks) {
+                    for (const groundingChunk of groundingChunks) {
+                        const source = groundingChunk.web;
+                        if (source && source.uri && !sourceUris.has(source.uri)) {
+                            sources.push({ uri: source.uri, title: source.title || source.uri });
+                            sourceUris.add(source.uri);
+                        }
+                    }
+                }
+
                 setMessages(prev => {
                     const newMessages = [...prev];
-                    newMessages[placeholderIndex] = { ...newMessages[placeholderIndex], text: fullText };
+                    newMessages[placeholderIndex] = { 
+                        ...newMessages[placeholderIndex], 
+                        text: fullText,
+                        sources: sources.length > 0 ? sources : undefined
+                    };
                     return newMessages;
                 });
             }
 
-            const finalMessage: DebateMessage = { persona, text: fullText, isStreaming: false };
+            const finalMessage: DebateMessage = { persona, text: fullText, isStreaming: false, sources: sources.length > 0 ? sources : undefined };
             generatedMessages.push(finalMessage);
             currentHistory.push(finalMessage);
 
@@ -114,68 +139,125 @@ const App: React.FC = () => {
             });
         }
         
-        // === PART 2: Generate Summary ===
-        setStatusText('Generating debate summary...');
+        // === PART 2: Generate Summary & Comparison ===
+        setStatusText('Generating debate summary and analysis...');
         try {
-            const debateSummary = await generateDebateSummary(currentHistory);
+            const [debateSummary, argumentComparison] = await Promise.all([
+                generateDebateSummary(currentHistory),
+                generateArgumentComparison(currentHistory)
+            ]);
             setSummary(debateSummary);
+            setComparison(argumentComparison);
         } catch(err: any) {
-            console.error("Failed to generate summary:", err.message);
+            console.error("Failed to generate post-debate analysis:", err.message);
         }
 
-        // === PART 3: Generate and play audio with pipelining ===
+        // === PART 3: Generate and play audio ===
         setPhase(DebatePhase.DEBATING);
         setStatusText('Debate script generated. Starting playback...');
         
         initializeAudio();
         
-        let nextAudioPromise: Promise<string> | null = null;
         const firstMessageOffset = systemMessages.length;
         
         for (let i = 0; i < generatedMessages.length; i++) {
+            if (isSkippedRef.current) break;
+
+            const interruptPromise: Promise<'turn' | 'voting'> = new Promise(resolve => {
+                skipTrigger.current = resolve;
+            });
+
             const currentMessage = generatedMessages[i];
             const messageIndex = firstMessageOffset + i;
-            
             setSpeakingMessageIndex(messageIndex);
-            setStatusText(`Speaking: ${currentMessage.persona} (${debateTurns[i].stage})`);
-
-            let currentAudioData: string;
-
-            if (nextAudioPromise) {
-                currentAudioData = await nextAudioPromise;
-            } else {
-                currentAudioData = await generateSpeech(currentMessage.text, currentMessage.persona as AIPersona);
-            }
-
-            if (i + 1 < generatedMessages.length) {
-                const nextMessage = generatedMessages[i+1];
-                nextAudioPromise = generateSpeech(nextMessage.text, nextMessage.persona as AIPersona);
-            } else {
-                nextAudioPromise = null;
+            
+            // Generate Audio
+            setStatusText(`Generating audio for ${currentMessage.persona}...`);
+            let audioData: string | undefined;
+            try {
+                const audioGenerationPromise = generateSpeech(currentMessage.text, currentMessage.persona as AIPersona);
+                const result = await Promise.race([audioGenerationPromise, interruptPromise]);
+                if (result === 'voting') break;
+                if (result === 'turn') continue;
+                audioData = result;
+            } catch (err) {
+                 if (!isSkippedRef.current) {
+                     console.error("Error during audio generation:", err);
+                     setError("Failed to generate audio for a turn.");
+                 }
+                break;
             }
             
-            if (currentAudioData) {
-                await playAudio(currentAudioData);
+            if (!audioData) continue;
+
+            // Play Audio
+            setStatusText(`Speaking: ${currentMessage.persona} (${debateTurns[i].stage})`);
+            try {
+                const playbackPromise = playAudio(audioData);
+                const result = await Promise.race([playbackPromise, interruptPromise]);
+                if (result === 'voting') break;
+                if (result === 'turn') continue;
+            } catch (err) {
+                 if (!isSkippedRef.current) {
+                    console.error("Error during audio playback:", err);
+                    setError("Failed to play audio for a turn.");
+                 }
+                break;
             }
         }
+        
+        skipTrigger.current = null;
+        if (!isSkippedRef.current) {
+            setSpeakingMessageIndex(null);
+            setStatusText('');
+            setPhase(DebatePhase.VOTING);
+        }
+    }
 
+    const playAudio = (base64Audio: string) => {
+        return new Promise<void>(async (resolve, reject) => {
+            if (!audioContextRef.current || isSkippedRef.current) return resolve();
+            
+            try {
+                const decodedData = decode(base64Audio);
+                const audioBuffer = await decodeAudioData(decodedData, audioContextRef.current, 24000, 1);
+                
+                if (isSkippedRef.current) return resolve();
+    
+                const source = audioContextRef.current!.createBufferSource();
+                currentAudioSourceRef.current = source;
+                source.buffer = audioBuffer;
+                source.connect(audioContextRef.current!.destination);
+                source.onended = () => {
+                    if (currentAudioSourceRef.current === source) {
+                        currentAudioSourceRef.current = null;
+                    }
+                    resolve();
+                };
+                source.start();
+            } catch (err) {
+                reject(err);
+            }
+        });
+    };
+
+    const handleSkip = () => {
+        if (currentAudioSourceRef.current) {
+            currentAudioSourceRef.current.stop();
+        }
+        skipTrigger.current?.('turn');
+    };
+
+    const handleSkipToVoting = () => {
+        if (isSkippedRef.current) return;
+        isSkippedRef.current = true;
+        if (currentAudioSourceRef.current) {
+            currentAudioSourceRef.current.stop();
+        }
+        skipTrigger.current?.('voting');
         setSpeakingMessageIndex(null);
         setStatusText('');
         setPhase(DebatePhase.VOTING);
-    }
-
-    const playAudio = async (base64Audio: string) => {
-        if (!audioContextRef.current) return;
-        const decodedData = decode(base64Audio);
-        const audioBuffer = await decodeAudioData(decodedData, audioContextRef.current, 24000, 1);
-        
-        return new Promise<void>((resolve) => {
-            const source = audioContextRef.current!.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(audioContextRef.current!.destination);
-            source.onended = () => resolve();
-            source.start();
-        });
     };
 
     const handleVote = (persona: AIPersona) => {
@@ -184,6 +266,11 @@ const App: React.FC = () => {
     };
 
     const handleReset = () => {
+        isSkippedRef.current = false;
+        if (currentAudioSourceRef.current) {
+            currentAudioSourceRef.current.stop();
+            currentAudioSourceRef.current = null;
+        }
         setPhase(DebatePhase.IDLE);
         setQuestion('');
         setMessages([]);
@@ -192,6 +279,7 @@ const App: React.FC = () => {
         setSpeakingMessageIndex(null);
         setStatusText('');
         setSummary(null);
+        setComparison(null);
     };
     
     const renderIdle = () => (
@@ -222,14 +310,26 @@ const App: React.FC = () => {
 
     const renderDebate = () => (
         <div className="w-full h-full flex flex-col bg-white rounded-2xl shadow-2xl overflow-hidden">
-            <div className="p-4 border-b">
-                <h2 className="text-lg font-semibold text-gray-800 truncate">Debate: {question}</h2>
-                {statusText && (
-                     <p className="text-sm text-gray-500 h-5 flex items-center">
-                        {phase === DebatePhase.ANALYZING && <LoadingSpinner className="w-4 h-4 mr-2" />}
-                        {statusText}
-                        {(phase === DebatePhase.ANALYZING || phase === DebatePhase.DEBATING) && <span className="animate-pulse">...</span>}
-                    </p>
+            <div className="p-4 border-b flex justify-between items-center">
+                <div>
+                    <h2 className="text-lg font-semibold text-gray-800 truncate">Debate: {question}</h2>
+                    {statusText && (
+                        <p className="text-sm text-gray-500 h-5 flex items-center">
+                            {phase === DebatePhase.ANALYZING && <LoadingSpinner className="w-4 h-4 mr-2" />}
+                            {statusText}
+                            {(phase === DebatePhase.ANALYZING || phase === DebatePhase.DEBATING) && <span className="animate-pulse">...</span>}
+                        </p>
+                    )}
+                </div>
+                {phase === DebatePhase.DEBATING && (
+                    <button 
+                        onClick={handleSkipToVoting}
+                        className="flex items-center gap-2 bg-gray-200 text-gray-700 font-semibold py-2 px-3 rounded-lg hover:bg-gray-300 transition-colors text-sm"
+                        aria-label="Skip to voting"
+                    >
+                        <FastForwardIcon className="w-4 h-4" />
+                        Skip to Voting
+                    </button>
                 )}
             </div>
             <div ref={debateLogRef} className="flex-grow p-4 space-y-4 overflow-y-auto">
@@ -239,17 +339,49 @@ const App: React.FC = () => {
                         className={`flex items-start gap-3 max-w-xl transition-all duration-300 ${msg.persona === AIPersona.Logos ? 'ml-auto flex-row-reverse' : msg.persona === AIPersona.Pathos ? 'mr-auto' : 'mx-auto'} ${speakingMessageIndex === index ? 'scale-105' : ''}`}
                     >
                         {msg.persona !== 'SYSTEM' && (
-                            <div className={`w-10 h-10 rounded-full flex-shrink-0 flex items-center justify-center font-bold text-white ${msg.persona === AIPersona.Logos ? 'bg-blue-600' : 'bg-purple-600'}`}>
+                            <div className={`w-10 h-10 rounded-full flex-shrink-0 flex items-center justify-center font-bold text-white mt-1 ${msg.persona === AIPersona.Logos ? 'bg-blue-600' : 'bg-purple-600'}`}>
                                 {msg.persona.slice(0, 1)}
                             </div>
                         )}
-                        <div className={`p-3 rounded-lg relative ${
+                        <div className={`p-3 rounded-lg relative flex-1 ${
                             msg.persona === AIPersona.Logos ? 'bg-blue-100 text-blue-900' :
                             msg.persona === AIPersona.Pathos ? 'bg-purple-100 text-purple-900' :
                             'bg-gray-200 text-gray-700 text-center w-full'
                         } ${speakingMessageIndex === index ? 'ring-2 ring-yellow-400' : ''}`}>
                             <p className="text-sm">{msg.text}{msg.isStreaming && <span className="inline-block w-1 h-4 bg-gray-600 animate-pulse ml-1"></span>}</p>
+                            {msg.sources && msg.sources.length > 0 && !msg.isStreaming && (
+                                <div className="mt-2 pt-2 border-t border-blue-200/50">
+                                    <h4 className="text-xs font-bold text-blue-800/70 mb-1 flex items-center gap-1.5">
+                                        <LinkIcon className="w-3.5 h-3.5" />
+                                        Sources
+                                    </h4>
+                                    <ul className="text-xs space-y-1">
+                                        {msg.sources.slice(0, 3).map((source, i) => (
+                                            <li key={i} className="truncate">
+                                                <a 
+                                                    href={source.uri} 
+                                                    target="_blank" 
+                                                    rel="noopener noreferrer"
+                                                    className="text-blue-600 hover:underline"
+                                                    title={source.uri}
+                                                >
+                                                    {source.title}
+                                                </a>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
                         </div>
+                        {speakingMessageIndex === index && phase === DebatePhase.DEBATING && (
+                            <button 
+                                onClick={handleSkip}
+                                className="p-2 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-600 transition-colors flex-shrink-0 mt-1"
+                                aria-label="Skip to next turn"
+                            >
+                                <SkipIcon className="w-5 h-5" />
+                            </button>
+                        )}
                     </div>
                 ))}
             </div>
@@ -289,18 +421,52 @@ const App: React.FC = () => {
                 </div>
             )}
             
+            {comparison ? (
+                <div className="mb-10">
+                    <h3 className="text-2xl font-bold mb-4 text-gray-800">Argument Breakdown</h3>
+                    <div className="overflow-x-auto bg-gray-50 rounded-lg border">
+                        <table className="w-full text-sm text-left text-gray-700">
+                            <thead className="bg-gray-100 text-xs text-gray-800 uppercase">
+                                <tr>
+                                    <th scope="col" className="px-6 py-3">Point of Contention</th>
+                                    <th scope="col" className="px-6 py-3">Logos (Logic & Data)</th>
+                                    <th scope="col" className="px-6 py-3">Pathos (Emotion & Morality)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {comparison.map((row, index) => (
+                                    <tr key={index} className="bg-white border-b hover:bg-gray-50">
+                                        <td className="px-6 py-4 font-semibold text-gray-900">{row.topic}</td>
+                                        <td className="px-6 py-4">{row.logosStance}</td>
+                                        <td className="px-6 py-4">{row.pathosStance}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            ) : (
+                <div className="mb-10">
+                    <h3 className="text-2xl font-bold mb-4 text-gray-800">Argument Breakdown</h3>
+                    <div className="flex justify-center items-center h-32 bg-gray-50 rounded-lg border">
+                        <LoadingSpinner />
+                        <p className="ml-4 text-gray-500">Analyzing arguments...</p>
+                    </div>
+                </div>
+            )}
+
             <div className="flex justify-center gap-8">
                 <button 
                     onClick={() => handleVote(AIPersona.Logos)} 
                     className="bg-blue-600 text-white font-bold py-4 px-8 rounded-lg hover:bg-blue-700 transition-transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
-                    disabled={!summary}
+                    disabled={!summary || !comparison}
                 >
                     Vote for Logos
                 </button>
                 <button 
                     onClick={() => handleVote(AIPersona.Pathos)} 
                     className="bg-purple-600 text-white font-bold py-4 px-8 rounded-lg hover:bg-purple-700 transition-transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
-                    disabled={!summary}
+                    disabled={!summary || !comparison}
                 >
                     Vote for Pathos
                 </button>
