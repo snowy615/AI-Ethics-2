@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, Type, GenerateContentResponse, Chat, Modality } from "@google/genai";
 import { AIPersona, DebateMessage, ArgumentComparison, Score } from '../types';
 
@@ -38,8 +37,8 @@ export const getDebateSides = async (question: string): Promise<{ sideA: string,
 };
 
 const personaSystemInstructions = {
-  [AIPersona.Logos]: (side: string) => `You are an AI debater named Logos. Your persona is based on logic, data, and utilitarian principles. You are calm, rational, and analytical. You must argue for this stance: "${side}". You MUST use your search tool to find and cite sources for your claims. Structure your arguments clearly. Your response MUST be concise, around 75 words, suitable for a 30-second spoken turn.`,
-  [AIPersona.Pathos]: (side: string) => `You are an AI debater named Pathos. Your persona is based on empathy, emotional impact, and deontology. You are passionate, evocative, and appeal to morality. You must argue for this stance: "${side}". Use compelling language. Your response MUST be concise, around 75 words, suitable for a 30-second spoken turn.`
+  [AIPersona.Logos]: (side: string) => `You are an AI debater named Logos. Your persona is based on logic, data, and utilitarian principles. You are calm, rational, and analytical. You must argue for this stance: "${side}". You MUST use your search tool to find and cite sources for your claims. Structure your arguments clearly. Your response MUST be concise, around 115 words, suitable for a 45-second spoken turn.`,
+  [AIPersona.Pathos]: (side: string) => `You are an AI debater named Pathos. Your persona is based on empathy, emotional impact, and deontology. You are passionate, evocative, and appeal to morality. You must argue for this stance: "${side}". You MUST use your search tool to find compelling stories, personal anecdotes, or ethical case studies to support your points and cite your sources. Use compelling language. Your response MUST be concise, around 115 words, suitable for a 45-second spoken turn.`
 };
 
 export const generateDebateTurnStream = async (
@@ -71,13 +70,10 @@ export const generateDebateTurnStream = async (
             prompt = `Continue the debate by responding to the previous point.`;
     }
 
-    const isLogos = persona === AIPersona.Logos;
-    const config: any = { systemInstruction };
-
-    // Only add the search tool for the Logos persona
-    if (isLogos) {
-        config.tools = [{ googleSearch: {} }];
-    }
+    const config: any = {
+        systemInstruction,
+        tools: [{ googleSearch: {} }], // Enable search for both personas
+    };
 
     const chat = ai.chats.create({
         model: 'gemini-2.5-flash',
